@@ -6,6 +6,7 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import StandardScaler
 from utils import *
+from utils import evaluate_full
 from model import *
 
 # =========================
@@ -178,17 +179,32 @@ optimizer_tf = Adam(model.parameters(), lr=1e-3)
 criterion = nn.BCELoss()
 
 best_auc = 0.0
+best_f1 = 0.0
+best_aupr = 0.0
+best_epoch = 0
 for epoch in range(NUM_EPOCHS_DETECTOR):
     train_loss = train_detector(model, train_loader_final, optimizer_tf, criterion, device)
     if (epoch + 1) % 10 == 0:
         print(f"\n[Transformer] Epoch {epoch+1}/{NUM_EPOCHS_DETECTOR}, Loss={train_loss:.4f}")
         print("Test set evaluation:")
-        _, auc = evaluate_with_classification_report_and_auc(model, test_loader, device, threshold=0.3)
-        if auc and auc > best_auc:
-            best_auc = auc
+        auroc, aupr, f1, _ = evaluate_full(model, test_loader, device)
+        if auroc and auroc > best_auc:
+            best_auc = auroc
+            best_f1 = f1
+            best_aupr = aupr
+            best_epoch = epoch + 1
+            # Save best model
+            best_detector_path = os.path.join(save_dir, "transformer_detector_gecco.pth")
+            torch.save(model.state_dict(), best_detector_path)
+            print(f"  >> New best model saved (epoch {best_epoch})")
         print("-" * 40)
 
-print(f"\nBest AUC-ROC: {best_auc:.4f}")
+print(f"\n{'='*50}")
+print(f"Best results (epoch {best_epoch}):")
+print(f"  AUC-ROC: {best_auc:.4f}")
+print(f"  AUPR:    {best_aupr:.4f}")
+print(f"  Best F1: {best_f1:.4f}")
+print(f"{'='*50}")
 
 
 # =========================
@@ -198,9 +214,8 @@ vae_path = os.path.join(save_dir, "beta_cvae_gecco.pth")
 torch.save(beta_cvae.state_dict(), vae_path)
 print(f"Beta-CVAE saved to: {vae_path}")
 
-detector_path = os.path.join(save_dir, "transformer_detector_gecco.pth")
-torch.save(model.state_dict(), detector_path)
-print(f"TransformerDetector saved to: {detector_path}")
+# Detector already saved at best epoch above
+print(f"TransformerDetector (best) saved to: {best_detector_path}")
 
 # Save config for SwiftHydra to use
 config = {
