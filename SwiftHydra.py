@@ -62,6 +62,13 @@ new_detector = TransformerDetector(input_size=input_dim).to(device)
 optimizer_cvae = Adam(loaded_beta_cvae.parameters(), lr=1e-4)
 optimizer_detector = Adam(new_detector.parameters(), lr=1e-4)
 criterion = nn.BCELoss()
+
+# PPO agent for later-stage adversarial generation
+warmup_episodes = 20
+ppo_policy = PolicyNetwork(input_dim, 256, input_dim).to(device)
+ppo_value  = ValueNetwork(input_dim * 2, 256).to(device)  # state = concat(x, x_adv) or x,z; here use x and candidate
+ppo_trainer = PPOTrainer(ppo_policy, ppo_value, policy_lr=1e-4, value_lr=1e-4, gamma=0.99, device=device)
+
 # File log
 log_dir = "./logs"
 os.makedirs(log_dir, exist_ok=True)
@@ -120,29 +127,64 @@ for ep in range(num_episodes):
 
     # Cập nhật vị trí bắt đầu cho vòng lặp tiếp theo
     start_idx = end_idx % len(idx_class1)
+    candidate_samples = []
+    candidate_deltas = []
     for syn_data in range(num_gen_data):
         unique, counts = np.unique(y_train.numpy(), return_counts=True)
         print("Phân phối lớp trong tập train:", dict(zip(unique, counts)))
         print("===== Generated Data {} =====".format(syn_data))
         random_idx = random.choice(idx_class1)
-        x_orig = D_train[random_idx]
-        x_adv = One_Step_To_Feasible_Action(
-            beta_cvae=loaded_beta_cvae,
-            detector=loaded_detector_model,
-            x_orig=x_orig,
-            device=device,
-            previously_generated=D_train_grow,
-            alpha=1.0,
-            lambda_div=0.1,
-            lr=0.01,
-            steps=20,
-            log_file=adversarial_log,
-        )
-        new_samples.append(x_adv.unsqueeze(0))
-        new_labels.append(torch.tensor([1]))
-        synthetic_data.append(x_adv)
-    new_samples = torch.cat(new_samples, dim=0)
-    new_labels = torch.cat(new_labels, dim=0)
+        x_orig = D_train[random_idx].to(device)
+
+        if ep < warmup_episodes:
+            x_adv = One_Step_To_Feasible_Action(
+                beta_cvae=loaded_beta_cvae,
+                detector=loaded_detector_model,
+                x_orig=x_orig,
+                device=device,
+                previously_generated=D_train_grow,
+                alpha=1.0,
+                lambda_div=0.1,
+                lr=0.01,
+                steps=20,
+                log_file=adversarial_log,
+            )
+            delta = x_adv - x_orig
+        else:
+            # PPO policy generates delta directly on x_orig
+            delta, logp, ent = ppo_policy.sample_action(x_orig.unsqueeze(0))
+            delta = delta.squeeze(0)
+            x_adv = x_orig + delta
+            x_adv = torch.clamp(x_adv, -3, 3)  # keep within normalized range
+
+        candidate_samples.append(x_adv.detach().cpu().unsqueeze(0))
+        candidate_deltas.append(delta.detach().cpu().unsqueeze(0))
+
+    candidates = torch.cat(candidate_samples, dim=0).to(device)
+    deltas = torch.cat(candidate_deltas, dim=0).to(device)
+
+    # Compute reward and pick top-l
+    with torch.no_grad():
+        detector_scores = loaded_detector_model(candidates).view(-1)  # lower better for anomaly
+    lambda_dist = 0.1
+    rewards = -detector_scores - lambda_dist * (deltas ** 2).sum(dim=1)
+    l_top = max(1, num_gen_data // 2)
+    top_idx = torch.topk(rewards, k=l_top).indices
+    selected = candidates[top_idx].cpu()
+
+    # PPO update when active
+    if ep >= warmup_episodes:
+        states = torch.cat([D_train[random.choice(idx_class1)].unsqueeze(0).to(device) for _ in range(l_top)], dim=0)
+        actions = deltas[top_idx]
+        old_log_probs = torch.zeros((l_top, 1), device=device)  # placeholder; one-step update
+        adv = rewards[top_idx].unsqueeze(1)
+        returns = adv  # simple baseline-free
+        ppo_trainer.ppo_update(states, actions, old_log_probs, returns, adv, n_epochs=2)
+
+    selected_labels = torch.ones(len(selected))
+    new_samples = torch.cat([s for s in selected], dim=0).unsqueeze(0) if len(selected.shape)==1 else selected
+    new_labels = selected_labels
+    synthetic_data.extend(list(selected))
     D_train = torch.cat([D_train, new_samples], dim=0)
     y_train = torch.cat([y_train, new_labels], dim=0)
 

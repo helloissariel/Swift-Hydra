@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import math
 from torch.optim import Adam
 from utils import *
 
@@ -177,15 +178,32 @@ class PolicyNetwork(nn.Module):
         super(PolicyNetwork, self).__init__()
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, output_dim)
+        # Separate heads for Gaussian policy
+        self.fc_mu = nn.Linear(hidden_dim, output_dim)
+        self.fc_log_std = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, x):
-        # x shape: (batch_size, input_dim)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        # Đầu ra của policy chính là modified z (dạng vector)
-        x = self.fc3(x)
-        return x
+        """
+        Returns mean and log_std for a diagonal Gaussian policy.
+        Args:
+            x: (batch, input_dim)
+        """
+        h = F.relu(self.fc1(x))
+        h = F.relu(self.fc2(h))
+        mu = self.fc_mu(h)
+        log_std = torch.clamp(self.fc_log_std(h), -5, 2)  # clamp for numerical stability
+        return mu, log_std
+
+    def sample_action(self, x):
+        """Reparameterized sample and corresponding log_prob."""
+        mu, log_std = self(x)
+        std = torch.exp(log_std)
+        eps = torch.randn_like(std)
+        action = mu + std * eps
+        # log_prob of diagonal Normal
+        log_prob = (-0.5 * (((action - mu) / std) ** 2 + 2 * log_std + math.log(2 * math.pi))).sum(dim=-1, keepdim=True)
+        entropy = (0.5 + 0.5 * math.log(2 * math.pi) + log_std).sum(dim=-1, keepdim=True)
+        return action, log_prob, entropy
 
 
 class ValueNetwork(nn.Module):
@@ -236,11 +254,7 @@ class PPOTrainer:
             log_prob: shape [batch_size, 1]
         """
         with torch.no_grad():
-            action = self.policy_net(state)
-        # Ở đây tạm coi action là continuous => log_prob = -||action||^2/2 (ví dụ)
-        # Hoặc ta có thể dùng Normal distribution, v.v.
-        # Minh hoạ đơn giản:
-        log_prob = -0.5 * torch.sum(action ** 2, dim=-1, keepdim=True)
+            action, log_prob, entropy = self.policy_net.sample_action(state)
         return action, log_prob
 
     def compute_advantages(self, rewards, values, next_values, dones):
@@ -257,9 +271,8 @@ class PPOTrainer:
         PPO cập nhật policy theo dữ liệu cũ (states, actions, etc.)
         """
         for _ in range(n_epochs):
-            # ----- TÍNH LẠI log_prob mới -----
-            new_actions = self.policy_net(states)  # new_actions ~ policy(state)
-            new_log_probs = -0.5 * torch.sum(new_actions ** 2, dim=-1, keepdim=True)
+            # ----- recompute log_prob under current policy -----
+            new_actions, new_log_probs, entropy = self.policy_net.sample_action(states)
 
             # Tính tỷ lệ r = exp(new_log_prob - old_log_prob)
             ratio = torch.exp(new_log_probs - old_log_probs)
@@ -274,14 +287,13 @@ class PPOTrainer:
             values_pred = self.value_net(states)
             value_loss = F.mse_loss(values_pred, returns)
 
-            # Entropy (ở đây tạm thời ta coi -||new_actions||^2/2 như log_prob => entropy có thể tính thủ công)
-            # Hoặc có thể thay thế bằng phân phối liên tục (Normal), v.v.
-            entropy = 0.5 * torch.mean(torch.sum(new_actions ** 2, dim=-1))
+            # Entropy bonus (from sampled Gaussian)
+            entropy_term = entropy.mean()
 
             # Tổng loss
             total_loss = policy_loss \
                          + self.value_coefficient * value_loss \
-                         - self.entropy_coefficient * entropy
+                         - self.entropy_coefficient * entropy_term
 
             # Update Policy
             self.policy_optimizer.zero_grad()
@@ -310,9 +322,7 @@ class PPOTrainer:
 
         # ----- Rollout -----
         with torch.no_grad():
-            actions = self.policy_net(states)
-            # log_prob cũ
-            old_log_probs = -0.5 * torch.sum(actions ** 2, dim=-1, keepdim=True)
+            actions, old_log_probs, entropy = self.policy_net.sample_action(states)
             values = self.value_net(states)
 
         rewards = compute_diversity_reward(actions)

@@ -81,8 +81,14 @@ def beta_cvae_loss_fn(x, x_recon, mean, logvar, beta=4.0):
     Returns:
         Total loss (scalar).
     """
-    recon_loss = F.mse_loss(x_recon, x, reduction='sum')
-    kl_loss = -0.5 * torch.sum(1 + logvar - mean.pow(2) - logvar.exp())
+    # Enhanced KL: 用 sigma_prior < 1 压紧潜空间
+    # 标准KL对应 sigma_prior=1.0
+    kl_loss = -0.5 * torch.sum(
+        1 + logvar 
+        - (mean ** 2) / (sigma_prior ** 2)
+        - logvar.exp() / (sigma_prior ** 2)
+        + 2 * torch.log(torch.tensor(sigma_prior))
+    )
     return recon_loss + beta * kl_loss
 
 def train_beta_cvae(model, data_loader, optimizer, device):
@@ -154,6 +160,12 @@ def compute_diversity_reward(modified_z):
     # Tùy chỉnh cách tính reward thực tế.
     # Ở đây minh hoạ: reward tỉ lệ với độ lớn L2 norm của z (giả sử).
     return torch.norm(modified_z, p=2, dim=-1, keepdim=True)
+
+def compute_reward(x_syn, detector, D_train, gamma, episode):
+    entropy = compute_entropy(D_train, x_syn)
+    detect_prob = detector(x_syn)
+    reward = (gamma ** episode) * entropy - torch.log(detect_prob)
+    return reward
 
 # Hàm tiện ích chuyển numpy -> torch
 def to_tensor(x, device="cpu", dtype=torch.float32):
