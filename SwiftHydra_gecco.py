@@ -309,18 +309,28 @@ model = TransformerDetector(input_size=input_dim).to(device)
 optimizer_tf = Adam(model.parameters(), lr=1e-3)
 criterion = nn.BCELoss()
 
+best_f1_score = 0.0
 best_auc = 0.0
+best_aupr = 0.0
+best_epoch = 0
 for epoch in range(100):
     train_loss = train_detector(model, train_loader_final, optimizer_tf, criterion, device)
     if (epoch + 1) % 10 == 0:
         print(f"\n[Transformer] Epoch {epoch+1}/100, Loss={train_loss:.4f}")
         print("Test set evaluation:")
-        auroc, aupr, best_f1, _ = evaluate_full(model, test_loader, device)
-        auc = auroc
-        if auc and auc > best_auc:
-            best_auc = auc
+        auroc, aupr, f1, _ = evaluate_full(model, test_loader, device)
+        if f1 and f1 > best_f1_score:
+            best_f1_score = f1
+            best_auc = auroc
+            best_aupr = aupr
+            best_epoch = epoch + 1
             torch.save(model.state_dict(), os.path.join(save_dir, "best_detector_gecco.pth"))
-            print(f"New best AUC-ROC: {best_auc:.4f} (saved)")
+            print(f"  >> New best model saved (epoch {best_epoch}, F1={best_f1_score:.4f})")
         print("-" * 40)
 
-print(f"\nBest AUC-ROC on GECCO: {best_auc:.4f}")
+print(f"\n{'='*50}")
+print(f"Best results after co-evolution (epoch {best_epoch}):")
+print(f"  Best F1: {best_f1_score:.4f}")
+print(f"  AUPR:    {best_aupr:.4f}")
+print(f"  AUC-ROC: {best_auc:.4f}")
+print(f"{'='*50}")

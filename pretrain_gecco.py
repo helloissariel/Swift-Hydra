@@ -188,15 +188,15 @@ for epoch in range(NUM_EPOCHS_DETECTOR):
         print(f"\n[Transformer] Epoch {epoch+1}/{NUM_EPOCHS_DETECTOR}, Loss={train_loss:.4f}")
         print("Test set evaluation:")
         auroc, aupr, f1, _ = evaluate_full(model, test_loader, device)
-        if auroc and auroc > best_auc:
+        if f1 and f1 > best_f1:
             best_auc = auroc
             best_f1 = f1
             best_aupr = aupr
             best_epoch = epoch + 1
-            # Save best model
+            # Save best model by Best F1
             best_detector_path = os.path.join(save_dir, "transformer_detector_gecco.pth")
             torch.save(model.state_dict(), best_detector_path)
-            print(f"  >> New best model saved (epoch {best_epoch})")
+            print(f"  >> New best model saved (epoch {best_epoch}, F1={best_f1:.4f})")
         print("-" * 40)
 
 print(f"\n{'='*50}")
