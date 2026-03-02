@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import classification_report, roc_auc_score
+from sklearn.metrics import (classification_report, roc_auc_score,
+                              average_precision_score, precision_recall_curve)
 import numpy as np
 from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
@@ -23,31 +24,63 @@ def load_adbench_data(dataset_path):
 def evaluate_with_classification_report_and_auc(model, test_loader, device, threshold=0.5):
     """
     Evaluate a model using classification report and AUC-ROC metric.
+    Legacy interface — calls evaluate_full internally.
+    """
+    auroc, aupr, best_f1, report = evaluate_full(model, test_loader, device)
+    return report, auroc
+
+
+def evaluate_full(model, test_loader, device):
+    """
+    Full evaluation with AUC-ROC, AUPR, and Best F1 (threshold-optimized).
+    
+    Follows the evaluation protocol used by GenIAS, CARLA, and other TSAD papers:
+    - AUC-ROC: Area under ROC curve
+    - AUPR: Area under Precision-Recall curve (important for imbalanced data)
+    - Best F1: Maximum F1 score across all possible thresholds
+    
+    Returns:
+        auroc, aupr, best_f1, classification_report_str
     """
     model.eval()
     all_preds, all_labels = [], []
     with torch.no_grad():
         for X_batch, y_batch in test_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            X_batch = X_batch.to(device)
             y_pred = model(X_batch).squeeze()
             all_preds.append(y_pred.cpu())
             all_labels.append(y_batch.cpu())
 
     preds = torch.cat(all_preds).numpy()
     labels = torch.cat(all_labels).numpy()
-    binary_preds = (preds > threshold).astype(int)
 
-    report = classification_report(labels, binary_preds, target_names=['Class 0', 'Class 1'])
+    if len(set(labels)) <= 1:
+        print("Evaluation: Only one class present in labels — metrics undefined.")
+        return None, None, None, None
+
+    # 1. AUC-ROC
+    auroc = roc_auc_score(labels, preds)
+
+    # 2. AUPR (Average Precision Score)
+    aupr = average_precision_score(labels, preds)
+
+    # 3. Best F1 (optimal threshold search)
+    precisions, recalls, thresholds = precision_recall_curve(labels, preds)
+    f1_scores = 2 * precisions * recalls / (precisions + recalls + 1e-8)
+    best_f1_idx = f1_scores.argmax()
+    best_f1 = f1_scores[best_f1_idx]
+    best_threshold = thresholds[best_f1_idx] if best_f1_idx < len(thresholds) else 0.5
+
+    # Classification report at best threshold
+    binary_preds = (preds > best_threshold).astype(int)
+    report = classification_report(labels, binary_preds, target_names=['Normal', 'Anomaly'])
+
+    print(f"AUC-ROC:  {auroc:.4f}")
+    print(f"AUPR:     {aupr:.4f}")
+    print(f"Best F1:  {best_f1:.4f} (threshold={best_threshold:.4f})")
     print(report)
 
-    if len(set(labels)) > 1:
-        aucroc = roc_auc_score(labels, preds)
-        print(f"AUC-ROC: {aucroc:.4f}")
-    else:
-        aucroc = None
-        print("AUC-ROC: Undefined (only one class present in labels)")
-
-    return report, aucroc
+    return auroc, aupr, best_f1, report
 
 def log_to_file(file_path, message):
     """Append a log message to the specified file."""

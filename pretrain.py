@@ -95,7 +95,7 @@ for epoch in range(num_epochs_tf):
     if (epoch + 1) % 10 == 0:
         print(f"[Transformer] Epoch {epoch+1}/{num_epochs_tf}, Loss={train_loss:.4f}")
         print("Test set evaluation:")
-        evaluate_with_classification_report_and_auc(model, test_loader, device, threshold=0.3)
+        evaluate_with_classification_report_and_auc(model, test_loader, device)
         print("-" * 40)
 
 # =========================

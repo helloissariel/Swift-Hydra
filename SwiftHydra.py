@@ -6,6 +6,7 @@ from sklearn.model_selection import train_test_split
 import random
 from sklearn.preprocessing import StandardScaler
 from utils import *
+from utils import evaluate_full
 from model import *
 import umap
 
@@ -309,7 +310,8 @@ for epoch in range(num_epochs_tf):
     if (epoch + 1) % 10 == 0:
         print(f"\n[Transformer] Epoch {epoch + 1}/{num_epochs_tf}, Loss={train_loss:.4f}")
         print("Test set evaluation:")
-        _, auc = evaluate_with_classification_report_and_auc(model, test_loader, device, threshold=0.3)
+        auroc, aupr, best_f1, _ = evaluate_full(model, test_loader, device)
+        auc = auroc
         if auc and auc > best_auc:
             best_auc = auc
             torch.save(model.state_dict(), os.path.join(save_dir, "best_detector.pth"))
