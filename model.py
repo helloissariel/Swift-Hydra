@@ -4,7 +4,6 @@ import torch.nn.functional as F
 import numpy as np
 import math
 from torch.optim import Adam
-from utils import *
 
 # =========================
 # 2. Beta-CVAE
@@ -21,44 +20,40 @@ class BetaCVAE(nn.Module):
         super(BetaCVAE, self).__init__()
         self.input_dim = input_dim
         self.latent_dim = latent_dim
-        self.beta = beta  # Scaling factor for KL divergence
+        self.beta = beta
 
         # Encoder layers
-        self.fc1 = nn.Linear(input_dim + 1, hidden_dim)  # Concatenate y -> +1
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)  # Additional hidden layer
+        self.fc1 = nn.Linear(input_dim + 1, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3_mean = nn.Linear(hidden_dim, latent_dim)
         self.fc3_logvar = nn.Linear(hidden_dim, latent_dim)
 
         # Decoder layers
-        self.fc4 = nn.Linear(latent_dim + 1, hidden_dim)  # Concatenate y -> +1
-        self.fc5 = nn.Linear(hidden_dim, hidden_dim)  # Additional hidden layer
+        self.fc4 = nn.Linear(latent_dim + 1, hidden_dim)
+        self.fc5 = nn.Linear(hidden_dim, hidden_dim)
         self.fc6 = nn.Linear(hidden_dim, input_dim)
 
     def encode(self, x, y):
-        """Encode input (x, y) into latent space with mean and log variance."""
-        xy = torch.cat([x, y], dim=1)  # Concatenate features and label (B, input_dim+1)
+        xy = torch.cat([x, y], dim=1)
         h = F.relu(self.fc1(xy))
-        h = F.relu(self.fc2(h))  # Additional hidden layer
+        h = F.relu(self.fc2(h))
         mean = self.fc3_mean(h)
         logvar = self.fc3_logvar(h)
         return mean, logvar
 
     def reparameterize(self, mean, logvar):
-        """Sample from latent space using reparameterization trick."""
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mean + eps * std
 
     def decode(self, z, y):
-        """Decode latent representation (z, y) back to input space."""
-        zy = torch.cat([z, y], dim=1)  # Concatenate latent vector and label (B, latent_dim+1)
+        zy = torch.cat([z, y], dim=1)
         h = F.relu(self.fc4(zy))
-        h = F.relu(self.fc5(h))  # Additional hidden layer
+        h = F.relu(self.fc5(h))
         x_recon = self.fc6(h)
         return x_recon
 
     def forward(self, x, y):
-        """Forward pass through the Beta-CVAE."""
         mean, logvar = self.encode(x, y)
         z = self.reparameterize(mean, logvar)
         x_recon = self.decode(z, y)
@@ -69,10 +64,6 @@ class BetaCVAE(nn.Module):
 # 3. Transformer Detector
 # =========================
 class PositionalEncoding(nn.Module):
-    """
-    Add positional encoding to the input for sequential modeling.
-    """
-
     def __init__(self, d_model, max_len=5000):
         super(PositionalEncoding, self).__init__()
         pe = torch.zeros(max_len, d_model)
@@ -80,25 +71,19 @@ class PositionalEncoding(nn.Module):
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        self.pe = pe.unsqueeze(0)  # Add batch dimension
+        self.pe = pe.unsqueeze(0)
 
     def forward(self, x):
-        """Add positional encoding to input tensor."""
-        L = x.size(1)  # Sequence length
+        L = x.size(1)
         return x + self.pe[:, :L, :].to(x.device)
 
 
 class TransformerDetector(nn.Module):
-    """
-    Transformer-based detector model for anomaly or binary classification tasks.
-    """
-
     def __init__(self, input_size, d_model=128, nhead=8, num_layers=2, dim_feedforward=256, dropout=0.1):
         super(TransformerDetector, self).__init__()
-        self.embedding = nn.Linear(input_size, d_model)  # Input embedding layer
-        self.positional_encoding = PositionalEncoding(d_model)  # Positional encoding
+        self.embedding = nn.Linear(input_size, d_model)
+        self.positional_encoding = PositionalEncoding(d_model)
 
-        # Transformer encoder layers
         encoder_layer = nn.TransformerEncoderLayer(d_model=d_model,
                                                    nhead=nhead,
                                                    dim_feedforward=dim_feedforward,
@@ -106,104 +91,94 @@ class TransformerDetector(nn.Module):
                                                    batch_first=True)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        # Fully connected layers for classification
         self.fc = nn.Sequential(
             nn.Linear(d_model, 128),
             nn.ReLU(),
             nn.Linear(128, 1),
-            nn.Sigmoid()  # Output probability for binary classification
+            nn.Sigmoid()
         )
 
     def forward(self, x):
-        """Forward pass through the Transformer Detector."""
         if x.dim() == 2:
-            x = x.unsqueeze(1)  # Add sequence dimension (B, 1, input_size)
-        x = self.embedding(x)  # Project input to d_model dimensions
-        x = self.positional_encoding(x)  # Add positional encoding
-        x = self.transformer_encoder(x)  # Transformer encoder
-        x = x.mean(dim=1)  # Aggregate features by averaging over sequence dimension
-        return self.fc(x).squeeze(1)  # Output probabilities
+            x = x.unsqueeze(1)
+        x = self.embedding(x)
+        x = self.positional_encoding(x)
+        x = self.transformer_encoder(x)
+        x = x.mean(dim=1)
+        return self.fc(x).squeeze(1)
 
+
+# =========================
+# 4. Mixture of Experts
+# =========================
 class MixtureOfExperts(nn.Module):
-    """
-    Mixture of Experts (MoE) architecture where each expert is a Transformer model.
-    """
     def __init__(self, input_size, num_experts, d_model=128, nhead=8, num_layers=2,
                  dim_feedforward=256, dropout=0.1, gating_hidden_size=64):
         super(MixtureOfExperts, self).__init__()
-
         self.num_experts = num_experts
 
-        # Define experts (Transformer models)
         self.experts = nn.ModuleList([
-            TransformerDetector(input_size=input_size,
-                                d_model=d_model,
-                                nhead=nhead,
-                                num_layers=num_layers,
-                                dim_feedforward=dim_feedforward,
-                                dropout=dropout)
+            TransformerDetector(input_size=input_size, d_model=d_model,
+                                nhead=nhead, num_layers=num_layers,
+                                dim_feedforward=dim_feedforward, dropout=dropout)
             for _ in range(num_experts)
         ])
 
-        # Gating network to decide expert weights
         self.gating_network = nn.Sequential(
             nn.Linear(input_size, gating_hidden_size),
             nn.ReLU(),
             nn.Linear(gating_hidden_size, num_experts),
-            nn.Softmax(dim=-1)  # Output weights for each expert
+            nn.Softmax(dim=-1)
         )
 
     def forward(self, x):
-        """
-        Forward pass through Mixture of Experts.
-        Args:
-            x: Input tensor of shape (batch_size, input_size).
-        Returns:
-            Output tensor of shape (batch_size).
-        """
-        # Compute gating weights
-        gating_weights = self.gating_network(x)  # (batch_size, num_experts)
-
-        # Collect outputs from experts
-        expert_outputs = torch.cat([expert(x).unsqueeze(1) for expert in self.experts], dim=1)  # (batch_size, num_experts)
-
-        # Combine expert outputs based on gating weights
-        output = torch.sum(expert_outputs * gating_weights, dim=1)  # (batch_size)
-
+        gating_weights = self.gating_network(x)
+        expert_outputs = torch.cat([expert(x).unsqueeze(1) for expert in self.experts], dim=1)
+        output = torch.sum(expert_outputs * gating_weights, dim=1)
         return output
 
 
+# =========================
+# 5. PPO Components
+# =========================
 class PolicyNetwork(nn.Module):
+    """
+    Gaussian policy that outputs (mu, log_std) for continuous actions.
+    Action = delta vector in input space, applied as x_adv = x_orig + delta.
+    """
     def __init__(self, input_dim, hidden_dim, output_dim):
         super(PolicyNetwork, self).__init__()
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        # Separate heads for Gaussian policy
         self.fc_mu = nn.Linear(hidden_dim, output_dim)
         self.fc_log_std = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, x):
-        """
-        Returns mean and log_std for a diagonal Gaussian policy.
-        Args:
-            x: (batch, input_dim)
-        """
         h = F.relu(self.fc1(x))
         h = F.relu(self.fc2(h))
         mu = self.fc_mu(h)
-        log_std = torch.clamp(self.fc_log_std(h), -5, 2)  # clamp for numerical stability
+        log_std = torch.clamp(self.fc_log_std(h), -5, 2)
         return mu, log_std
 
     def sample_action(self, x):
-        """Reparameterized sample and corresponding log_prob."""
+        """Reparameterized sample with log_prob and entropy."""
         mu, log_std = self(x)
         std = torch.exp(log_std)
         eps = torch.randn_like(std)
         action = mu + std * eps
-        # log_prob of diagonal Normal
-        log_prob = (-0.5 * (((action - mu) / std) ** 2 + 2 * log_std + math.log(2 * math.pi))).sum(dim=-1, keepdim=True)
+        log_prob = (-0.5 * (((action - mu) / (std + 1e-8)) ** 2
+                    + 2 * log_std + math.log(2 * math.pi))).sum(dim=-1, keepdim=True)
         entropy = (0.5 + 0.5 * math.log(2 * math.pi) + log_std).sum(dim=-1, keepdim=True)
         return action, log_prob, entropy
+
+    def log_prob_of(self, x, action):
+        """Compute log_prob of a given action under the current policy."""
+        mu, log_std = self(x)
+        std = torch.exp(log_std)
+        log_prob = (-0.5 * (((action - mu) / (std + 1e-8)) ** 2
+                    + 2 * log_std + math.log(2 * math.pi))).sum(dim=-1, keepdim=True)
+        entropy = (0.5 + 0.5 * math.log(2 * math.pi) + log_std).sum(dim=-1, keepdim=True)
+        return log_prob, entropy
 
 
 class ValueNetwork(nn.Module):
@@ -216,17 +191,23 @@ class ValueNetwork(nn.Module):
     def forward(self, x):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
-        value = self.fc3(x)
-        return value
+        return self.fc3(x)
 
 
 class PPOTrainer:
+    """
+    PPO trainer for the cooperative evolution between generator and detector.
+    
+    The policy generates delta vectors in input space. The reward is designed
+    to balance diversity (entropy) and adversarial quality (deceiving detector),
+    following Swift Hydra's formulation with gamma decay.
+    """
     def __init__(
             self,
             policy_net: PolicyNetwork,
             value_net: ValueNetwork,
-            policy_lr=1e-3,
-            value_lr=1e-3,
+            policy_lr=1e-4,
+            value_lr=1e-4,
             gamma=0.99,
             clip_epsilon=0.2,
             value_coefficient=0.5,
@@ -234,149 +215,66 @@ class PPOTrainer:
             device="cpu"
     ):
         self.device = device
-
         self.policy_net = policy_net.to(device)
         self.value_net = value_net.to(device)
-
         self.policy_optimizer = Adam(self.policy_net.parameters(), lr=policy_lr)
         self.value_optimizer = Adam(self.value_net.parameters(), lr=value_lr)
-
         self.gamma = gamma
         self.clip_epsilon = clip_epsilon
         self.value_coefficient = value_coefficient
         self.entropy_coefficient = entropy_coefficient
 
-    def get_action_and_log_prob(self, state):
-        """
-        state: torch.Tensor shape [batch_size, input_dim]
-        return:
-            action (modified_z): shape [batch_size, output_dim]
-            log_prob: shape [batch_size, 1]
-        """
-        with torch.no_grad():
-            action, log_prob, entropy = self.policy_net.sample_action(state)
-        return action, log_prob
-
-    def compute_advantages(self, rewards, values, next_values, dones):
-        """
-        Tính advantage theo GAE hoặc đơn giản.
-        Ở đây ví dụ tính advantage theo công thức:
-            A = r + gamma * V_next * (1-done) - V
-        """
-        advantages = rewards + self.gamma * next_values * (1 - dones) - values
-        return advantages
-
     def ppo_update(self, states, actions, old_log_probs, returns, advantages, n_epochs=4):
         """
-        PPO cập nhật policy theo dữ liệu cũ (states, actions, etc.)
+        PPO clipped objective update.
+        
+        Args:
+            states: (N, input_dim) — the x_orig used to generate each sample
+            actions: (N, output_dim) — the delta vectors that were applied
+            old_log_probs: (N, 1) — log_prob at the time of generation
+            returns: (N, 1) — reward (used as return in single-step setting)
+            advantages: (N, 1) — advantage estimates
+            n_epochs: number of PPO update epochs per call
         """
+        states = states.to(self.device)
+        actions = actions.to(self.device)
+        old_log_probs = old_log_probs.to(self.device)
+        returns = returns.to(self.device)
+        advantages = advantages.to(self.device)
+
         for _ in range(n_epochs):
-            # ----- recompute log_prob under current policy -----
-            new_actions, new_log_probs, entropy = self.policy_net.sample_action(states)
+            # Recompute log_prob of the SAME actions under current policy
+            new_log_probs, entropy = self.policy_net.log_prob_of(states, actions)
 
-            # Tính tỷ lệ r = exp(new_log_prob - old_log_prob)
-            ratio = torch.exp(new_log_probs - old_log_probs)
+            ratio = torch.exp(new_log_probs - old_log_probs.detach())
 
-            # Tính clipped objective
             adv = advantages.detach()
+            # Normalize advantages for stability
+            if adv.numel() > 1:
+                adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
             obj1 = ratio * adv
-            obj2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * adv
+            obj2 = torch.clamp(ratio, 1.0 - self.clip_epsilon,
+                               1.0 + self.clip_epsilon) * adv
             policy_loss = -torch.mean(torch.min(obj1, obj2))
 
             # Value loss
             values_pred = self.value_net(states)
             value_loss = F.mse_loss(values_pred, returns)
 
-            # Entropy bonus (from sampled Gaussian)
-            entropy_term = entropy.mean()
+            # Entropy bonus
+            entropy_bonus = entropy.mean()
 
-            # Tổng loss
-            total_loss = policy_loss \
-                         + self.value_coefficient * value_loss \
-                         - self.entropy_coefficient * entropy_term
+            total_loss = (policy_loss
+                          + self.value_coefficient * value_loss
+                          - self.entropy_coefficient * entropy_bonus)
 
-            # Update Policy
+            # Update policy
             self.policy_optimizer.zero_grad()
+            self.value_optimizer.zero_grad()
             total_loss.backward()
+            # Gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=0.5)
+            torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), max_norm=0.5)
             self.policy_optimizer.step()
-
-            # Update Value
-            # => Ở đây ta đã gộp chung backward, tuỳ bạn tách ra hay gộp
-            # Thường tách ra cho rõ ràng:
-            #   self.value_optimizer.zero_grad()
-            #   value_loss.backward()
-            #   self.value_optimizer.step()
-
-    def train_step(self, data_distributions, z_vectors, batch_size=32, n_epochs=4):
-        """
-        Mỗi train_step mô phỏng:
-          1. Lấy (state) = concat(data_distribution, z_vector).
-          2. Lấy hành động: modified_z.
-          3. Tính reward dựa trên độ đa dạng => compute_diversity_reward(modified_z).
-          4. Cập nhật policy & value theo PPO.
-        """
-        self.policy_net.train()
-        self.value_net.train()
-
-        states = torch.cat([data_distributions, z_vectors], dim=-1)
-
-        # ----- Rollout -----
-        with torch.no_grad():
-            actions, old_log_probs, entropy = self.policy_net.sample_action(states)
-            values = self.value_net(states)
-
-        rewards = compute_diversity_reward(actions)
-        dones = torch.zeros_like(rewards)  # Ví dụ: không có khái niệm done, cho = 0
-        # Giả sử ta ước lượng next_state giống state (mô phỏng) => next_value
-        next_values = values  # cho đơn giản, tuỳ logic môi trường của bạn
-
-        # ----- Tính return & advantage -----
-        advantages = self.compute_advantages(rewards, values, next_values, dones)
-        returns = values + advantages
-
-        # PPO update
-        self.ppo_update(states, actions, old_log_probs, returns, advantages, n_epochs)
-
-# import torch
-# import torch.nn as nn
-# import math
-# from mamba_ssm import Mamba
-#
-#
-# class MambaNet(nn.Module):
-#     def __init__(self, input_size):
-#         super(MambaNet, self).__init__()
-#
-#         self.mamba = Mamba(
-#             # This module uses roughly 3 * expand * d_model^2 parameters
-#             d_model=input_size,  # Model dimension d_model
-#             d_state=128,  # SSM state expansion factor
-#             d_conv=2,  # Local convolution width
-#             expand=2,  # Block expansion factor
-#         )
-#
-#         self.fc1 = nn.Linear(input_size, 256)
-#         self.dropout1 = nn.Dropout(0.2)
-#         # self.fc2 = nn.Linear(256, 256)
-#         # self.dropout2 = nn.Dropout(0.2)
-#         # self.fc3 = nn.Linear(256, 256)
-#         # self.dropout3 = nn.Dropout(0.2)
-#         # self.fc4 = nn.Linear(256, 256)
-#         # self.dropout4 = nn.Dropout(0.2)
-#         self.fc5 = nn.Linear(256, 1)
-#         self.leaky_relu = nn.LeakyReLU(0.1)
-#         self.sigmoid = nn.Sigmoid()
-#
-#     def forward(self, x):
-#         x = self.mamba(x.unsqueeze(1)).squeeze(1)
-#         x = self.leaky_relu(self.fc1(x))
-#         x = self.dropout1(x)
-#         # x = self.leaky_relu(self.fc2(x))
-#         # x = self.dropout2(x)
-#         # x = self.leaky_relu(self.fc3(x))
-#         # x = self.dropout3(x)
-#         # x = self.leaky_relu(self.fc4(x))
-#         # x = self.dropout4(x)
-#         x = self.fc5(x)
-#         x = self.sigmoid(x)
-#         return x
+            self.value_optimizer.step()

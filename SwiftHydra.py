@@ -1,6 +1,5 @@
 import os
 import matplotlib.pyplot as plt
-from sklearn.manifold import TSNE
 from torch.optim import Adam
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
@@ -10,133 +9,134 @@ from utils import *
 from model import *
 import umap
 
-# Ví dụ đường dẫn
+# =========================
+# Configuration
+# =========================
 dataset_path = r"ADBench_datasets/7_Cardiotocography.npz"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# Lưu Beta-CVAE
-# Đảm bảo thư mục lưu trữ tồn tại
 save_dir = "./saved_models"
 vae_path = os.path.join(save_dir, "beta_cvae.pth")
 detector_path = os.path.join(save_dir, "transformer_detector.pth")
 
-# 4.1: Load Data
+# Hyperparameters
+NUM_EPISODES = 100
+NUM_GEN_DATA = 50
+BATCH_SIZE = 128
+WARMUP_EPISODES = 20
+TOP_L_RATIO = 0.5          # Keep top 50% of generated samples
+SIGMA_PRIOR = 0.5          # Enhanced KL prior (< 1.0 for tighter latent space)
+GAMMA_DECAY = 0.95         # Reward gamma decay: early=diversity, late=deceive
+CLAMP_RANGE = 3.0          # Clamp generated samples to normalized range
+
+# =========================
+# 1. Load Data
+# =========================
 X_all, y_all = load_adbench_data(dataset_path)
 input_dim = X_all.shape[1]
 
 scaler = StandardScaler()
 X_all = torch.tensor(scaler.fit_transform(X_all)).float()
 
-# Chia train/test
 D_train_np, D_test_np, y_train_np, y_test_np = train_test_split(
     X_all.numpy(), y_all.numpy(), test_size=0.6, random_state=42, stratify=y_all
 )
 D_train = torch.tensor(D_train_np, dtype=torch.float32)
 y_train = torch.tensor(y_train_np, dtype=torch.float32)
-D_test  = torch.tensor(D_test_np,  dtype=torch.float32)
-y_test  = torch.tensor(y_test_np,  dtype=torch.float32)
+D_test = torch.tensor(D_test_np, dtype=torch.float32)
+y_test = torch.tensor(y_test_np, dtype=torch.float32)
 
-# DataLoader cho Beta-CVAE
-train_dataset = TensorDataset(D_train, y_train)
-train_loader  = DataLoader(train_dataset, batch_size=64, shuffle=True)
-
-# Khởi tạo mô hình cùng cấu hình ban đầu
+# =========================
+# 2. Load Pretrained Models
+# =========================
 loaded_beta_cvae = BetaCVAE(input_dim=input_dim, hidden_dim=512, latent_dim=64, beta=1.0).to(device)
 loaded_detector_model = TransformerDetector(input_size=input_dim).to(device)
 
-# Load trạng thái mô hình đã lưu
-# Chỉ load trọng số
 loaded_beta_cvae.load_state_dict(torch.load(vae_path, weights_only=True))
 loaded_detector_model.load_state_dict(torch.load(detector_path, weights_only=True))
-
-# Đặt mô hình về chế độ eval (nếu chỉ sử dụng inference)
 loaded_beta_cvae.eval()
 loaded_detector_model.eval()
+print("Pretrained models loaded successfully.")
 
-print("Models loaded successfully.")
-
-
-num_episodes = 100
-num_gen_data = 50
-batch_size = 128
+# =========================
+# 3. Initialize Training Components
+# =========================
+# New detector for co-evolution (separate from pretrained one used for reward)
 new_detector = TransformerDetector(input_size=input_dim).to(device)
 optimizer_cvae = Adam(loaded_beta_cvae.parameters(), lr=1e-4)
 optimizer_detector = Adam(new_detector.parameters(), lr=1e-4)
 criterion = nn.BCELoss()
 
-# PPO agent for later-stage adversarial generation
-warmup_episodes = 20
+# PPO agent (activates after warmup)
 ppo_policy = PolicyNetwork(input_dim, 256, input_dim).to(device)
-ppo_value  = ValueNetwork(input_dim * 2, 256).to(device)  # state = concat(x, x_adv) or x,z; here use x and candidate
-ppo_trainer = PPOTrainer(ppo_policy, ppo_value, policy_lr=1e-4, value_lr=1e-4, gamma=0.99, device=device)
+ppo_value = ValueNetwork(input_dim, 256).to(device)
+ppo_trainer = PPOTrainer(
+    ppo_policy, ppo_value,
+    policy_lr=1e-4, value_lr=1e-4,
+    gamma=0.99, clip_epsilon=0.2,
+    entropy_coefficient=0.01,
+    device=device
+)
 
-# File log
+# Logging
 log_dir = "./logs"
 os.makedirs(log_dir, exist_ok=True)
 beta_cvae_log = os.path.join(log_dir, "beta_cvae.log")
 detector_log = os.path.join(log_dir, "detector.log")
 adversarial_log = os.path.join(log_dir, "adversarial_samples.log")
+episode_log = os.path.join(log_dir, "episode_summary.log")
+
 synthetic_data = []
-start_idx = 0  # Vị trí bắt đầu ban đầu
 
-for ep in range(num_episodes):
-    # Lấy mask cho class 1
-    class1_mask = (y_train == 1)  # Boolean tensor: True nếu y_train[i] == 1
-    class0_mask = (y_train == 0)  # Boolean tensor: True nếu y_train[i] == 0
-
-    # Đếm số lượng phần tử của mỗi class
+# =========================
+# 4. Co-Evolution Main Loop
+# =========================
+for ep in range(NUM_EPISODES):
+    class1_mask = (y_train == 1)
+    class0_mask = (y_train == 0)
     num_class1 = class1_mask.sum().item()
     num_class0 = class0_mask.sum().item()
 
-    # Kiểm tra nếu số lượng class 1 vượt quá class 0, thoát vòng lặp
+    # Stop if anomaly class exceeds normal class
     if num_class1 > num_class0:
         print(f"Break at Episode {ep + 1}: Class 1 ({num_class1}) exceeds Class 0 ({num_class0}).")
         break
-    # Lọc các mẫu thuộc class 1 từ D_train
-    # Lọc các mẫu thuộc class 1 từ D_train
-    D_train_grow_tensor = D_train[class1_mask]  # Tensor chứa tất cả các mẫu class 1
-    # Chuyển mỗi hàng thành một tensor và lưu vào list
-    D_train_grow = [row for row in D_train_grow_tensor]
-    print(f"===== EPISODE {ep + 1}/{num_episodes} =====")
 
-    # Train Beta-CVAE
+    print(f"\n{'='*60}")
+    print(f"EPISODE {ep + 1}/{NUM_EPISODES} | Class 0: {num_class0} | Class 1: {num_class1}")
+    print(f"Mode: {'Warmup (gradient descent)' if ep < WARMUP_EPISODES else 'PPO'}")
+    print(f"{'='*60}")
+
+    # --- 4.1: Train Beta-CVAE on current D_train ---
     train_dataset = TensorDataset(D_train, y_train)
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
     num_epochs_cvae = 10
     for epoch in range(num_epochs_cvae):
-        loss_cvae = train_beta_cvae(loaded_beta_cvae, train_loader, optimizer_cvae, device)
-        log_to_file(beta_cvae_log, f"Epoch {epoch + 1}/{num_epochs_cvae}, Loss: {loss_cvae:.4f}")
+        loss_cvae = train_beta_cvae(loaded_beta_cvae, train_loader, optimizer_cvae,
+                                     device, sigma_prior=SIGMA_PRIOR)
+        log_to_file(beta_cvae_log, f"Episode {ep+1} Epoch {epoch+1}/{num_epochs_cvae}, Loss: {loss_cvae:.4f}")
 
+    # --- 4.2: Train Detector on BALANCED dataset ---
+    balanced_loader = make_balanced_loader(D_train, y_train, batch_size=BATCH_SIZE)
     detector_epochs = 5
-    train_dataset_detector = TensorDataset(D_train, y_train)
-    train_loader_detector = DataLoader(train_dataset_detector, batch_size=batch_size, shuffle=True)
     for det_epoch in range(detector_epochs):
-        detector_loss = train_detector(new_detector, train_loader_detector, optimizer_detector, criterion, device)
-        # Giả sử y_train có dạng 0/1
-    # print(f"===== Evaluate in Testing set =====")
-    # evaluate_with_classification_report_and_auc(model, test_loader, device, threshold=0.5)
-    # Generate Adversarial Samples
+        detector_loss = train_detector(new_detector, balanced_loader, optimizer_detector, criterion, device)
+        log_to_file(detector_log, f"Episode {ep+1} Epoch {det_epoch+1}/{detector_epochs}, Loss: {detector_loss:.4f}")
+
+    # --- 4.3: Generate Adversarial Samples ---
     idx_class1 = (y_train == 1).nonzero(as_tuple=True)[0]
-    new_samples, new_labels = [], []
-    # Lấy các index từ idx_class1, xử lý wrap-around nếu cần
-    end_idx = start_idx + num_gen_data
-    indices = idx_class1[start_idx:end_idx]
+    D_train_grow = [row for row in D_train[class1_mask]]
 
-    # Nếu vượt quá độ dài của idx_class1, quay lại từ đầu
-    if end_idx > len(idx_class1):
-        indices += idx_class1[:end_idx - len(idx_class1)]
-
-    # Cập nhật vị trí bắt đầu cho vòng lặp tiếp theo
-    start_idx = end_idx % len(idx_class1)
     candidate_samples = []
+    candidate_origins = []    # Track which x_orig produced each sample
+    candidate_log_probs = []  # Track log_probs for PPO update
     candidate_deltas = []
-    for syn_data in range(num_gen_data):
-        unique, counts = np.unique(y_train.numpy(), return_counts=True)
-        print("Phân phối lớp trong tập train:", dict(zip(unique, counts)))
-        print("===== Generated Data {} =====".format(syn_data))
+
+    for syn_idx in range(NUM_GEN_DATA):
         random_idx = random.choice(idx_class1)
         x_orig = D_train[random_idx].to(device)
 
-        if ep < warmup_episodes:
+        if ep < WARMUP_EPISODES:
+            # --- Warmup: gradient descent in latent space ---
             x_adv = One_Step_To_Feasible_Action(
                 beta_cvae=loaded_beta_cvae,
                 detector=loaded_detector_model,
@@ -149,142 +149,171 @@ for ep in range(num_episodes):
                 steps=20,
                 log_file=adversarial_log,
             )
-            delta = x_adv - x_orig
+            delta = (x_adv - x_orig.cpu()).to(device)
+            log_prob = torch.zeros(1, 1, device=device)  # No PPO log_prob in warmup
         else:
-            # PPO policy generates delta directly on x_orig
-            delta, logp, ent = ppo_policy.sample_action(x_orig.unsqueeze(0))
+            # --- PPO: policy generates delta ---
+            delta, log_prob, ent = ppo_policy.sample_action(x_orig.unsqueeze(0))
             delta = delta.squeeze(0)
+            log_prob = log_prob.detach()
             x_adv = x_orig + delta
-            x_adv = torch.clamp(x_adv, -3, 3)  # keep within normalized range
+            x_adv = torch.clamp(x_adv, -CLAMP_RANGE, CLAMP_RANGE)
+            x_adv = x_adv.detach().cpu()
 
         candidate_samples.append(x_adv.detach().cpu().unsqueeze(0))
+        candidate_origins.append(x_orig.detach().cpu().unsqueeze(0))
+        candidate_log_probs.append(log_prob.detach().cpu())
         candidate_deltas.append(delta.detach().cpu().unsqueeze(0))
 
-    candidates = torch.cat(candidate_samples, dim=0).to(device)
-    deltas = torch.cat(candidate_deltas, dim=0).to(device)
+    candidates = torch.cat(candidate_samples, dim=0)   # (NUM_GEN_DATA, input_dim)
+    origins = torch.cat(candidate_origins, dim=0)       # (NUM_GEN_DATA, input_dim)
+    log_probs = torch.cat(candidate_log_probs, dim=0)   # (NUM_GEN_DATA, 1)
+    deltas = torch.cat(candidate_deltas, dim=0)         # (NUM_GEN_DATA, input_dim)
 
-    # Compute reward and pick top-l
-    with torch.no_grad():
-        detector_scores = loaded_detector_model(candidates).view(-1)  # lower better for anomaly
-    lambda_dist = 0.1
-    rewards = -detector_scores - lambda_dist * (deltas ** 2).sum(dim=1)
-    l_top = max(1, num_gen_data // 2)
+    # --- 4.4: Compute Rewards (Swift Hydra formulation) ---
+    rewards = compute_reward(
+        x_syn=candidates,
+        detector=loaded_detector_model,
+        D_train=D_train,
+        gamma_decay=GAMMA_DECAY,
+        episode=ep,
+        device=device
+    )
+
+    # --- 4.5: Select Top-l samples by reward ---
+    l_top = max(1, int(NUM_GEN_DATA * TOP_L_RATIO))
     top_idx = torch.topk(rewards, k=l_top).indices
-    selected = candidates[top_idx].cpu()
-
-    # PPO update when active
-    if ep >= warmup_episodes:
-        states = torch.cat([D_train[random.choice(idx_class1)].unsqueeze(0).to(device) for _ in range(l_top)], dim=0)
-        actions = deltas[top_idx]
-        old_log_probs = torch.zeros((l_top, 1), device=device)  # placeholder; one-step update
-        adv = rewards[top_idx].unsqueeze(1)
-        returns = adv  # simple baseline-free
-        ppo_trainer.ppo_update(states, actions, old_log_probs, returns, adv, n_epochs=2)
-
+    selected = candidates[top_idx]
     selected_labels = torch.ones(len(selected))
-    new_samples = torch.cat([s for s in selected], dim=0).unsqueeze(0) if len(selected.shape)==1 else selected
-    new_labels = selected_labels
+
+    avg_reward = rewards[top_idx].mean().item()
+    print(f"Top-{l_top} avg reward: {avg_reward:.4f}")
+    log_to_file(episode_log, f"Episode {ep+1}: top-{l_top} avg_reward={avg_reward:.4f} "
+                f"class0={num_class0} class1={num_class1}")
+
+    # --- 4.6: PPO Update (after warmup) ---
+    if ep >= WARMUP_EPISODES:
+        ppo_states = origins[top_idx].to(device)
+        ppo_actions = deltas[top_idx].to(device)
+        ppo_old_log_probs = log_probs[top_idx].to(device)
+        ppo_rewards_selected = rewards[top_idx].unsqueeze(1).to(device)
+
+        # Use reward as return (single-step MDP)
+        # Advantage = reward - value baseline
+        with torch.no_grad():
+            values = ppo_value(ppo_states)
+        advantages = ppo_rewards_selected - values
+        returns = ppo_rewards_selected
+
+        ppo_trainer.ppo_update(
+            states=ppo_states,
+            actions=ppo_actions,
+            old_log_probs=ppo_old_log_probs,
+            returns=returns,
+            advantages=advantages,
+            n_epochs=3
+        )
+        print(f"PPO updated with {l_top} samples")
+
+    # --- 4.7: Augment training set ---
     synthetic_data.extend(list(selected))
-    D_train = torch.cat([D_train, new_samples], dim=0)
-    y_train = torch.cat([y_train, new_labels], dim=0)
+    D_train = torch.cat([D_train, selected], dim=0)
+    y_train = torch.cat([y_train, selected_labels], dim=0)
 
-#___________________________________________________________
-# 4.4: Visualize Generated Data
+print(f"\n{'='*60}")
+print(f"Co-evolution complete. Total synthetic samples: {len(synthetic_data)}")
+print(f"Final dataset: {len(D_train)} samples")
+print(f"{'='*60}")
 
+# =========================
+# 5. Visualize Generated Data (UMAP)
+# =========================
+plt.style.use('default')
 
+# Reset to original data for visualization
+D_train_orig = torch.tensor(D_train_np, dtype=torch.float32)
+y_train_orig = torch.tensor(y_train_np, dtype=torch.float32)
 
-plt.style.use('default')  # Đảm bảo sử dụng style mặc định
+X_synthetic = torch.stack(synthetic_data) if synthetic_data else torch.empty(0, input_dim)
 
-D_train = torch.tensor(D_train_np, dtype=torch.float32)
-y_train = torch.tensor(y_train_np, dtype=torch.float32)
-D_test  = torch.tensor(D_test_np,  dtype=torch.float32)
-y_test  = torch.tensor(y_test_np,  dtype=torch.float32)
+X_plot = torch.cat([D_train_orig, D_test, X_synthetic], dim=0).numpy()
 
-X_synthetic = np.asarray(synthetic_data)
-X_synthetic = torch.tensor(X_synthetic,  dtype=torch.float32)
-
-# 1) Gộp dữ liệu
-X_plot = torch.cat([D_train, D_test, X_synthetic], dim=0).numpy()
-
-# Tạo nhãn:
-# - Phần đầu: y_train (0 hoặc 1)
-# - Tiếp theo: y_test (0 hoặc 1)
-# - Cuối cùng: synthetic (2)
-N_train = len(D_train)
+N_train = len(D_train_orig)
 N_test = len(D_test)
 N_synthetic = len(X_synthetic)
 y_plot = np.concatenate([
-    y_train.numpy(),            # Nhãn train
-    y_test.numpy(),             # Nhãn test
-    np.full((N_synthetic,), 2)  # Nhãn synthetic
+    y_train_orig.numpy(),
+    y_test.numpy(),
+    np.full((N_synthetic,), 2)
 ], axis=0)
 
-# 2) Chuẩn hoá dữ liệu (nếu cần)
-scaler = StandardScaler()
-X_plot_scaled = scaler.fit_transform(X_plot)
+scaler_plot = StandardScaler()
+X_plot_scaled = scaler_plot.fit_transform(X_plot)
 
-# 3) Tính UMAP
 reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, n_components=2, n_jobs=-1)
-
 X_embedded = reducer.fit_transform(X_plot_scaled)
-# X_embedded.shape = (N_train + N_test + N_synthetic, 2)
 
-# 4) Vẽ
-plt.figure(figsize=(10, 8), facecolor='white')  # Đặt nền trắng
+plt.figure(figsize=(10, 8), facecolor='white')
 
-# Train Class 0 -> đỏ
 idx0_train = (y_plot[:N_train] == 0)
 plt.scatter(X_embedded[:N_train][idx0_train, 0], X_embedded[:N_train][idx0_train, 1],
             c='darkred', alpha=0.6, label='Class 0 (Train)')
 
-# Train Class 1 -> xanh dương
 idx1_train = (y_plot[:N_train] == 1)
 plt.scatter(X_embedded[:N_train][idx1_train, 0], X_embedded[:N_train][idx1_train, 1],
             c='darkblue', alpha=0.6, label='Class 1 (Train)')
 
-# Test Class 0 -> cam
 idx0_test = (y_plot[N_train:N_train + N_test] == 0)
 plt.scatter(X_embedded[N_train:N_train + N_test][idx0_test, 0],
             X_embedded[N_train:N_train + N_test][idx0_test, 1],
             c='orange', alpha=0.6, label='Class 0 (Test)')
 
-# Test Class 1 -> xanh nhạt
 idx1_test = (y_plot[N_train:N_train + N_test] == 1)
 plt.scatter(X_embedded[N_train:N_train + N_test][idx1_test, 0],
             X_embedded[N_train:N_train + N_test][idx1_test, 1],
             c='skyblue', alpha=0.6, label='Class 1 (Test)')
 
-# Synthetic Data -> xanh lá
-idx_syn = (y_plot[N_train + N_test:] == 2)
-plt.scatter(X_embedded[N_train + N_test:][idx_syn, 0],
-            X_embedded[N_train + N_test:][idx_syn, 1],
-            c='green', alpha=0.6, label='Synthetic')
+if N_synthetic > 0:
+    idx_syn = (y_plot[N_train + N_test:] == 2)
+    plt.scatter(X_embedded[N_train + N_test:][idx_syn, 0],
+                X_embedded[N_train + N_test:][idx_syn, 1],
+                c='green', alpha=0.6, label='Synthetic')
 
 plt.title("UMAP Visualization: Train, Test, and Synthetic Data")
 plt.legend()
+plt.savefig("umap_visualization.png", dpi=150, bbox_inches='tight')
 plt.show()
+print("UMAP saved to umap_visualization.png")
 
-
-#______________________________________________________
-  # 4.4: Train mô hình TransformerDetector
+# =========================
+# 6. Final Evaluation
+# =========================
 train_dataset_final = TensorDataset(D_train, y_train)
 test_dataset = TensorDataset(D_test, y_test)
 train_loader_final = DataLoader(train_dataset_final, batch_size=64, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=64)
-print("After oversampling using VAE:")
-unique, counts = np.unique(y_train.numpy(), return_counts=True)
-print("Class distribution in the training set:", dict(zip(unique, counts)))
 
-# model = MixtureOfExperts(input_size=input_dim, num_experts= 10)
+print("\nAfter co-evolution augmentation:")
+unique, counts = np.unique(y_train.numpy(), return_counts=True)
+print("Class distribution:", dict(zip(unique.astype(int), counts)))
+
+# Train final detector from scratch on augmented data
 model = TransformerDetector(input_size=input_dim).to(device)
 optimizer_tf = Adam(model.parameters(), lr=1e-3)
 criterion = nn.BCELoss()
 num_epochs_tf = 100
+
+best_auc = 0.0
 for epoch in range(num_epochs_tf):
     train_loss = train_detector(model, train_loader_final, optimizer_tf, criterion, device)
-    print(f"[Transformer] Epoch {epoch + 1}/{num_epochs_tf}, Loss={train_loss:.4f}")
+    if (epoch + 1) % 10 == 0:
+        print(f"\n[Transformer] Epoch {epoch + 1}/{num_epochs_tf}, Loss={train_loss:.4f}")
+        print("Test set evaluation:")
+        _, auc = evaluate_with_classification_report_and_auc(model, test_loader, device, threshold=0.3)
+        if auc and auc > best_auc:
+            best_auc = auc
+            torch.save(model.state_dict(), os.path.join(save_dir, "best_detector.pth"))
+            print(f"New best AUC-ROC: {best_auc:.4f} (saved)")
+        print("-" * 40)
 
-    # Đánh giá
-    print("Test set evaluation:")
-    evaluate_with_classification_report_and_auc(model, test_loader, device, threshold=0.3)
-    print("-" * 40)
+print(f"\nBest AUC-ROC: {best_auc:.4f}")

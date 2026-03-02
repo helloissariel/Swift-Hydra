@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from sklearn.metrics import classification_report, roc_auc_score
 import numpy as np
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 # =========================
 # 1. Load & Utility Functions
@@ -22,34 +23,23 @@ def load_adbench_data(dataset_path):
 def evaluate_with_classification_report_and_auc(model, test_loader, device, threshold=0.5):
     """
     Evaluate a model using classification report and AUC-ROC metric.
-    Args:
-        model: Trained model to evaluate.
-        test_loader: DataLoader for test data.
-        device: Computation device (CPU/GPU).
-        threshold: Threshold for binary classification.
-    Returns:
-        Classification report and AUC-ROC score.
     """
     model.eval()
     all_preds, all_labels = [], []
     with torch.no_grad():
         for X_batch, y_batch in test_loader:
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-            y_pred = model(X_batch).squeeze()  # Predicted scores (B,)
+            y_pred = model(X_batch).squeeze()
             all_preds.append(y_pred.cpu())
             all_labels.append(y_batch.cpu())
 
-    preds = torch.cat(all_preds).numpy()  # Flatten predictions
-    labels = torch.cat(all_labels).numpy()  # Flatten labels
-
-    # Convert predictions to binary labels
+    preds = torch.cat(all_preds).numpy()
+    labels = torch.cat(all_labels).numpy()
     binary_preds = (preds > threshold).astype(int)
 
-    # Generate classification report
     report = classification_report(labels, binary_preds, target_names=['Class 0', 'Class 1'])
     print(report)
 
-    # Calculate AUC-ROC if both classes are present
     if len(set(labels)) > 1:
         aucroc = roc_auc_score(labels, preds)
         print(f"AUC-ROC: {aucroc:.4f}")
@@ -60,59 +50,64 @@ def evaluate_with_classification_report_and_auc(model, test_loader, device, thre
     return report, aucroc
 
 def log_to_file(file_path, message):
-    """
-    Append a log message to the specified file.
-    Args:
-        file_path: Path to the log file.
-        message: Message to log.
-    """
+    """Append a log message to the specified file."""
     with open(file_path, "a") as file:
         file.write(message + "\n")
 
-def beta_cvae_loss_fn(x, x_recon, mean, logvar, beta=4.0):
+
+# =========================
+# 2. Loss Functions
+# =========================
+
+def beta_cvae_loss_fn(x, x_recon, mean, logvar, beta=4.0, sigma_prior=0.5):
     """
-    Compute Beta-CVAE loss (Reconstruction + Beta * KL Divergence).
+    Compute Beta-CVAE loss with Enhanced KL Divergence (inspired by GenIAS).
+    
+    Using sigma_prior < 1.0 enforces tighter latent representations of normal
+    samples, improving separation between normal and anomalous data.
+    Standard KL corresponds to sigma_prior=1.0.
+    
     Args:
         x: Original input data.
         x_recon: Reconstructed data.
         mean: Mean of latent space distribution.
         logvar: Log variance of latent space distribution.
         beta: Weight for KL divergence.
+        sigma_prior: Prior standard deviation (< 1.0 for tighter latent space).
     Returns:
         Total loss (scalar).
     """
-    # Enhanced KL: 用 sigma_prior < 1 压紧潜空间
-    # 标准KL对应 sigma_prior=1.0
+    recon_loss = F.mse_loss(x_recon, x, reduction='sum')
+    
+    # Enhanced KL with tunable prior variance
+    sigma_prior_sq = sigma_prior ** 2
     kl_loss = -0.5 * torch.sum(
-        1 + logvar 
-        - (mean ** 2) / (sigma_prior ** 2)
-        - logvar.exp() / (sigma_prior ** 2)
-        + 2 * torch.log(torch.tensor(sigma_prior))
+        1 + logvar
+        - (mean ** 2) / sigma_prior_sq
+        - logvar.exp() / sigma_prior_sq
+        + 2 * torch.log(torch.tensor(sigma_prior, device=x.device))
     )
     return recon_loss + beta * kl_loss
 
-def train_beta_cvae(model, data_loader, optimizer, device):
+
+# =========================
+# 3. Training Functions
+# =========================
+
+def train_beta_cvae(model, data_loader, optimizer, device, sigma_prior=0.5):
     """
     Train Beta-CVAE model for one epoch.
-    Args:
-        model: Beta-CVAE model to train.
-        data_loader: DataLoader for training data.
-        optimizer: Optimizer for model parameters.
-        device: Computation device (CPU/GPU).
-    Returns:
-        Average loss over the epoch.
     """
     model.train()
     total_loss = 0
     for x_batch, y_batch in data_loader:
         x_batch = x_batch.to(device)
-        y_batch = y_batch.to(device).unsqueeze(1)  # Reshape labels (B, 1)
+        y_batch = y_batch.to(device).unsqueeze(1)
 
-        # Forward pass
         x_recon, mean, logvar = model(x_batch, y_batch)
-        loss = beta_cvae_loss_fn(x_batch, x_recon, mean, logvar, beta=model.beta)
+        loss = beta_cvae_loss_fn(x_batch, x_recon, mean, logvar,
+                                  beta=model.beta, sigma_prior=sigma_prior)
 
-        # Backward pass
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -123,25 +118,15 @@ def train_beta_cvae(model, data_loader, optimizer, device):
 def train_detector(model, train_loader, optimizer, criterion, device):
     """
     Train a detector model for one epoch.
-    Args:
-        model: Detector model to train.
-        train_loader: DataLoader for training data.
-        optimizer: Optimizer for model parameters.
-        criterion: Loss function (e.g., BCE Loss).
-        device: Computation device (CPU/GPU).
-    Returns:
-        Average loss over the epoch.
     """
     model.train()
     total_loss = 0
     for X_batch, y_batch in train_loader:
         X_batch, y_batch = X_batch.to(device), y_batch.to(device)
 
-        # Forward pass
         y_pred = model(X_batch)
         loss = criterion(y_pred, y_batch)
 
-        # Backward pass
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -149,29 +134,99 @@ def train_detector(model, train_loader, optimizer, criterion, device):
         total_loss += loss.item()
     return total_loss / len(train_loader)
 
+def make_balanced_loader(D_train, y_train, batch_size=64):
+    """
+    Create a DataLoader with balanced sampling (equal normal/anomaly per batch).
+    Uses WeightedRandomSampler to handle class imbalance.
+    """
+    class_counts = torch.bincount(y_train.long())
+    weights = 1.0 / class_counts.float()
+    sample_weights = weights[y_train.long()]
+    sampler = WeightedRandomSampler(sample_weights, num_samples=len(y_train), replacement=True)
+    dataset = TensorDataset(D_train, y_train)
+    return DataLoader(dataset, batch_size=batch_size, sampler=sampler)
 
-# Để tái lập trình ngẫu nhiên cho ví dụ
+
+# =========================
+# 4. Reward Functions
+# =========================
+
 torch.manual_seed(0)
 np.random.seed(0)
 
-# Giả sử ta có một hàm tính reward liên quan đến "độ đa dạng" (diversity)
-# Ở đây, tạm thời ta giả lập bằng cách random ra reward để minh hoạ.
-def compute_diversity_reward(modified_z):
-    # Tùy chỉnh cách tính reward thực tế.
-    # Ở đây minh hoạ: reward tỉ lệ với độ lớn L2 norm của z (giả sử).
-    return torch.norm(modified_z, p=2, dim=-1, keepdim=True)
+def compute_entropy(D_train, x_syn, n_bins=50):
+    """
+    Estimate entropy increase after adding x_syn to D_train.
+    Uses histogram-based approximation over feature dimensions.
+    
+    Args:
+        D_train: Current training data (N, d).
+        x_syn: New synthetic sample (1, d) or (d,).
+    Returns:
+        Entropy estimate (scalar tensor).
+    """
+    if x_syn.dim() == 1:
+        x_syn = x_syn.unsqueeze(0)
+    
+    combined = torch.cat([D_train, x_syn], dim=0)
+    entropy = 0.0
+    for d in range(combined.shape[1]):
+        col = combined[:, d]
+        hist = torch.histc(col, bins=n_bins)
+        probs = hist / hist.sum()
+        probs = probs[probs > 0]
+        entropy += -(probs * torch.log(probs)).sum()
+    
+    return entropy / combined.shape[1]  # Average entropy across dimensions
 
-def compute_reward(x_syn, detector, D_train, gamma, episode):
-    entropy = compute_entropy(D_train, x_syn)
-    detect_prob = detector(x_syn)
-    reward = (gamma ** episode) * entropy - torch.log(detect_prob)
+def compute_reward(x_syn, detector, D_train, gamma_decay, episode, device):
+    """
+    Compute reward following Swift Hydra's formulation:
+        R = gamma^episode * H(D_train ∪ x_syn) - log(W(x_syn))
+    
+    Early episodes: gamma^episode ≈ 1, emphasis on diversity (entropy).
+    Later episodes: gamma^episode → 0, emphasis on deceiving detector.
+    
+    Args:
+        x_syn: Generated synthetic samples (N, d).
+        detector: Trained detector model.
+        D_train: Current training data.
+        gamma_decay: Decay factor for entropy weight (0 < gamma < 1).
+        episode: Current episode number.
+        device: Computation device.
+    Returns:
+        Reward tensor (N,).
+    """
+    detector.eval()
+    x_syn = x_syn.to(device)
+    
+    with torch.no_grad():
+        detect_prob = detector(x_syn).view(-1)
+    
+    # Entropy term (batched approximation)
+    D_train_dev = D_train.to(device)
+    entropy_rewards = []
+    for i in range(x_syn.shape[0]):
+        ent = compute_entropy(D_train_dev, x_syn[i])
+        entropy_rewards.append(ent)
+    entropy_term = torch.stack(entropy_rewards).to(device)
+    
+    # Combined reward with gamma decay
+    gamma_weight = gamma_decay ** episode
+    reward = gamma_weight * entropy_term - torch.log(detect_prob + 1e-8)
+    
     return reward
 
-# Hàm tiện ích chuyển numpy -> torch
+
+# =========================
+# 5. Utility Functions
+# =========================
+
 def to_tensor(x, device="cpu", dtype=torch.float32):
     if isinstance(x, np.ndarray):
         x = torch.from_numpy(x)
     return x.to(device=device, dtype=dtype)
+
 
 def One_Step_To_Feasible_Action(
         beta_cvae,
@@ -186,20 +241,11 @@ def One_Step_To_Feasible_Action(
         log_file=None
 ):
     """
-    Generate adversarial samples by modifying latent space representation.
-    Args:
-        beta_cvae: Trained Beta-CVAE model.
-        detector: Trained detector model.
-        x_orig: Original input data.
-        device: Computation device (CPU/GPU).
-        previously_generated: List of previously generated samples (for diversity).
-        alpha: Scaling factor for diversity term.
-        lambda_div: Weight for diversity term.
-        lr: Learning rate for optimization.
-        steps: Number of optimization steps.
-        log_file: Path to log file for recording progress.
-    Returns:
-        Adversarial sample (torch.Tensor).
+    Generate adversarial samples by gradient descent in latent space.
+    Used during warmup episodes before PPO takes over.
+    
+    Optimizes: min prob_class1 + lambda_div * similarity_to_previous
+    (i.e., generate samples that fool detector AND are diverse)
     """
     beta_cvae.eval()
     detector.eval()
@@ -207,43 +253,47 @@ def One_Step_To_Feasible_Action(
     if previously_generated is None:
         previously_generated = []
 
-    x_orig = x_orig.to(device).unsqueeze(0)  # Reshape to batch format (1, d)
-    y_class1 = torch.full((1, 1), 0.8, device=device)  # Target class label (e.g., 0.8)
+    x_orig = x_orig.to(device).unsqueeze(0)
+    y_class1 = torch.full((1, 1), 1.0, device=device)  # Use 1.0 for consistent conditioning
 
     # Encode input data into latent space
     with torch.no_grad():
         mean, logvar = beta_cvae.encode(x_orig, y_class1)
         z = beta_cvae.reparameterize(mean, logvar).detach().clone()
+    
+    z.requires_grad_(True)
 
     # Optimize latent space representation
     optimizer_z = torch.optim.Adam([z], lr=lr)
     for step in range(steps):
         optimizer_z.zero_grad()
 
-        # Decode latent variable back to data space
         x_synthetic = beta_cvae.decode(z, y_class1)
-
-        # Calculate detector prediction
         prob_class1 = detector(x_synthetic)
 
-        # Diversity term (if previous samples exist)
+        # Diversity term
         if previously_generated:
-            x_old_cat = torch.stack(previously_generated, dim=0).to(device)  # Stack previous samples (N, d)
-            dist = torch.norm(x_synthetic - x_old_cat, p=2, dim=1)  # Pairwise distances
+            x_old_cat = torch.stack(previously_generated, dim=0).to(device)
+            dist = torch.norm(x_synthetic - x_old_cat, p=2, dim=1)
             diversity_term = torch.exp(-alpha * dist).sum()
         else:
-            diversity_term = 0.0
+            diversity_term = torch.tensor(0.0, device=device)
 
-        # Calculate total reward (inverse objective)
-        inv_reward = prob_class1.mean() + lambda_div * diversity_term
-        inv_reward.backward()
+        # Loss = detection probability + similarity penalty (minimize both)
+        loss = prob_class1.mean() + lambda_div * diversity_term
+        loss.backward()
         optimizer_z.step()
 
-    print(f"Deceiving Detector Reward: {1/ (prob_class1.item()+0.0001):.4f}",
-          f"Diversity reward: {1/(diversity_term+0.0001):.4f}",
-          f"Sample reward: {1/(inv_reward.item()+0.0001):.4f}")
+    deceive_reward = 1.0 / (prob_class1.item() + 1e-4)
+    div_val = diversity_term.item() if torch.is_tensor(diversity_term) else diversity_term
+    div_reward = 1.0 / (div_val + 1e-4)
+    print(f"Deceiving Detector Reward: {deceive_reward:.4f}",
+          f"Diversity reward: {div_reward:.4f}",
+          f"Loss: {loss.item():.4f}")
 
-    # Decode optimized latent variable back to data space
+    if log_file:
+        log_to_file(log_file, f"deceive={deceive_reward:.4f} div={div_reward:.4f} loss={loss.item():.4f}")
+
     with torch.no_grad():
         x_adv = beta_cvae.decode(z, y_class1).detach().cpu().squeeze(0)
     return x_adv
