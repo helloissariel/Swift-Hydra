@@ -183,6 +183,7 @@ for ep in range(NUM_EPISODES):
 
     # --- 4.5: Select Top-l samples by reward ---
     l_top = max(1, int(NUM_GEN_DATA * TOP_L_RATIO))
+    rewards = rewards.cpu()
     top_idx = torch.topk(rewards, k=l_top).indices
     selected = candidates[top_idx]
     selected_labels = torch.ones(len(selected))
