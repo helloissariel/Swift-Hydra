@@ -155,6 +155,13 @@ with torch.no_grad():
     y_synthetic_c = torch.full((num_generate, 1), 1.0, device=device)
     X_synthetic = beta_cvae.decode(z_sample, y_synthetic_c).cpu()
 
+# Clean synthetic data: remove NaN/Inf and clamp extreme values
+nan_mask = torch.isnan(X_synthetic).any(dim=1) | torch.isinf(X_synthetic).any(dim=1)
+if nan_mask.any():
+    print(f"  Warning: removed {nan_mask.sum().item()} NaN/Inf synthetic samples")
+    X_synthetic = X_synthetic[~nan_mask]
+X_synthetic = torch.clamp(X_synthetic, -10.0, 10.0)  # Clamp extremes (data is standardized)
+
 y_synthetic_labels = torch.ones(num_generate)
 
 D_train_final = torch.cat([D_train, X_synthetic], dim=0)

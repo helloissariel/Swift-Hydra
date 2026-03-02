@@ -151,21 +151,31 @@ def train_beta_cvae(model, data_loader, optimizer, device, sigma_prior=0.5):
 def train_detector(model, train_loader, optimizer, criterion, device):
     """
     Train a detector model for one epoch.
+    Clamps predictions to [1e-7, 1-1e-7] to prevent BCELoss NaN/CUDA assert.
     """
     model.train()
     total_loss = 0
     for X_batch, y_batch in train_loader:
         X_batch, y_batch = X_batch.to(device), y_batch.to(device)
 
+        # Skip batch if input contains NaN/Inf
+        if torch.isnan(X_batch).any() or torch.isinf(X_batch).any():
+            continue
+
         y_pred = model(X_batch)
+        y_pred = torch.clamp(y_pred, 1e-7, 1 - 1e-7)  # Stabilize for BCELoss
         loss = criterion(y_pred, y_batch)
+
+        if torch.isnan(loss):
+            continue
 
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         total_loss += loss.item()
-    return total_loss / len(train_loader)
+    return total_loss / max(len(train_loader), 1)
 
 def make_balanced_loader(D_train, y_train, batch_size=64):
     """
