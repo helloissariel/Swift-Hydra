@@ -1,6 +1,7 @@
 import os
 import json
 import numpy as np
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from torch.optim import Adam
 from torch.utils.data import DataLoader, TensorDataset
@@ -70,6 +71,7 @@ print("Pretrained GECCO models loaded successfully.")
 # 3. Initialize Training Components
 # =========================
 new_detector = TransformerDetector(input_size=input_dim).to(device)
+new_detector.load_state_dict(torch.load(detector_path, weights_only=True))  # Fix2: start from pretrained
 optimizer_cvae = Adam(loaded_beta_cvae.parameters(), lr=1e-4)
 optimizer_detector = Adam(new_detector.parameters(), lr=1e-4)
 criterion = nn.BCEWithLogitsLoss()
@@ -143,7 +145,7 @@ for ep in range(NUM_EPISODES):
         if ep < WARMUP_EPISODES:
             x_adv = One_Step_To_Feasible_Action(
                 beta_cvae=loaded_beta_cvae,
-                detector=loaded_detector_model,
+                detector=new_detector,  # Fix2: use co-evolving detector
                 x_orig=x_orig,
                 device=device,
                 previously_generated=D_train_grow,
@@ -172,7 +174,7 @@ for ep in range(NUM_EPISODES):
 
     # --- 4.4: Compute Rewards ---
     rewards = compute_reward(
-        x_syn=candidates, detector=loaded_detector_model,
+        x_syn=candidates, detector=new_detector,  # Fix2: use co-evolving detector
         D_train=D_train, gamma_decay=GAMMA_DECAY,
         episode=ep, device=device
     )
@@ -182,7 +184,18 @@ for ep in range(NUM_EPISODES):
     rewards = rewards.cpu()
     top_idx = torch.topk(rewards, k=l_top).indices
     selected = candidates[top_idx]
+
+    # Fix3: CVAE plausibility filter — remove samples that drifted too far from anomaly distribution
+    with torch.no_grad():
+        sel_dev = selected.to(device)
+        y_cond = torch.ones(len(sel_dev), 1, device=device)
+        x_recon, _, _ = loaded_beta_cvae(sel_dev, y_cond)
+        recon_err = F.mse_loss(x_recon, sel_dev, reduction='none').mean(dim=1)
+        err_threshold = recon_err.median() + recon_err.std()
+        plausible_mask = recon_err <= err_threshold
+        selected = selected[plausible_mask.cpu()]
     selected_labels = torch.ones(len(selected))
+    print(f"  Plausibility filter: {plausible_mask.sum().item()}/{l_top} samples kept")
 
     avg_reward = rewards[top_idx].mean().item()
     print(f"Top-{l_top} avg reward: {avg_reward:.4f}")
@@ -296,17 +309,19 @@ print("UMAP saved to gecco_umap.png")
 # =========================
 # 6. Final Evaluation
 # =========================
-train_dataset_final = TensorDataset(D_train, y_train)
+# Fix1: Use balanced sampling for final training (handles remaining class imbalance)
+train_loader_final = make_balanced_loader(D_train, y_train, batch_size=64)
 test_dataset = TensorDataset(D_test, y_test)
-train_loader_final = DataLoader(train_dataset_final, batch_size=64, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=64)
 
 print("\nAfter co-evolution augmentation:")
 unique, counts = np.unique(y_train.numpy(), return_counts=True)
 print("Class distribution:", dict(zip(unique.astype(int), counts)))
 
+# Fix4: Fine-tune from pretrained model instead of training from scratch
 model = TransformerDetector(input_size=input_dim).to(device)
-optimizer_tf = Adam(model.parameters(), lr=1e-3)
+model.load_state_dict(torch.load(detector_path, weights_only=True))
+optimizer_tf = Adam(model.parameters(), lr=1e-4)  # Lower LR for fine-tuning
 criterion = nn.BCEWithLogitsLoss()
 
 best_f1_score = 0.0
