@@ -48,6 +48,7 @@ def evaluate_full(model, test_loader, device):
         for X_batch, y_batch in test_loader:
             X_batch = X_batch.to(device)
             y_pred = model(X_batch).squeeze()
+            y_pred = torch.sigmoid(y_pred)
             all_preds.append(y_pred.cpu())
             all_labels.append(y_batch.cpu())
 
@@ -234,7 +235,7 @@ def compute_reward(x_syn, detector, D_train, gamma_decay, episode, device):
     x_syn = x_syn.to(device)
     
     with torch.no_grad():
-        detect_prob = detector(x_syn).view(-1)
+        detect_prob = torch.sigmoid(detector(x_syn)).view(-1)
     
     # Entropy term (batched approximation)
     D_train_dev = D_train.to(device)
@@ -302,7 +303,7 @@ def One_Step_To_Feasible_Action(
         optimizer_z.zero_grad()
 
         x_synthetic = beta_cvae.decode(z, y_class1)
-        prob_class1 = detector(x_synthetic)
+        prob_class1 = torch.sigmoid(detector(x_synthetic))
 
         # Diversity term
         if previously_generated:

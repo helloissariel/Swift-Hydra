@@ -95,7 +95,6 @@ class TransformerDetector(nn.Module):
             nn.Linear(d_model, 128),
             nn.ReLU(),
             nn.Linear(128, 1),
-            nn.Sigmoid()
         )
 
     def forward(self, x):

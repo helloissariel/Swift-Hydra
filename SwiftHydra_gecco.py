@@ -72,7 +72,7 @@ print("Pretrained GECCO models loaded successfully.")
 new_detector = TransformerDetector(input_size=input_dim).to(device)
 optimizer_cvae = Adam(loaded_beta_cvae.parameters(), lr=1e-4)
 optimizer_detector = Adam(new_detector.parameters(), lr=1e-4)
-criterion = nn.BCELoss()
+criterion = nn.BCEWithLogitsLoss()
 
 # PPO agent
 ppo_policy = PolicyNetwork(input_dim, 256, input_dim).to(device)
@@ -307,7 +307,7 @@ print("Class distribution:", dict(zip(unique.astype(int), counts)))
 
 model = TransformerDetector(input_size=input_dim).to(device)
 optimizer_tf = Adam(model.parameters(), lr=1e-3)
-criterion = nn.BCELoss()
+criterion = nn.BCEWithLogitsLoss()
 
 best_f1_score = 0.0
 best_auc = 0.0
